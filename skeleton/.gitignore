@@ -8,6 +8,10 @@ data/reports/*
 data/cf-reports/*
 !data/cf-reports/.gitkeep
 
+# 运行时队列和状态文件
+data/*.json
+data/*.log
+
 # 环境配置
 .env
 .env.local

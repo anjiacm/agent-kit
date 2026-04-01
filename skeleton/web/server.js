@@ -1,12 +1,12 @@
-const express = require('express');
-const { WebSocketServer } = require('ws');
-const http = require('http');
-const path = require('path');
-const fs = require('fs');
+const express = require("express");
+const { WebSocketServer } = require("ws");
+const http = require("http");
+const path = require("path");
+const fs = require("fs");
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({ server, path: "/ws" });
 
 const PORT = process.env.DASHBOARD_PORT || 7890;
 
@@ -16,53 +16,101 @@ const state = {
   groups: {},
   workers: {},
   workerIdCounter: 0,
-  claudeStatus: 'idle',
+  claudeStatus: "idle",
   operation: null,
   progress: null,
 };
 let pendingMessages = [];
+let messageIdCounter = 0;
+const MESSAGE_QUEUE_FILE = path.join(
+  __dirname,
+  "..",
+  "data",
+  "message-queue.json",
+);
+
+function persistMessages() {
+  try {
+    const dir = path.dirname(MESSAGE_QUEUE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      MESSAGE_QUEUE_FILE,
+      JSON.stringify(
+        { messages: pendingMessages, lastId: messageIdCounter },
+        null,
+        2,
+      ),
+    );
+  } catch (e) {
+    console.error("persistMessages failed:", e.message);
+  }
+}
+
+function loadMessages() {
+  try {
+    if (fs.existsSync(MESSAGE_QUEUE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(MESSAGE_QUEUE_FILE, "utf8"));
+      pendingMessages = data.messages || [];
+      messageIdCounter = data.lastId || 0;
+    }
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+loadMessages();
+
 const history = [];
 let historyIdCounter = 0;
 const HISTORY_MAX = 100;
 const wsClients = new Set();
 
 // ─── Middleware ───
-app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static(path.join(__dirname, "public")));
 
 // ─── WebSocket ───
-wss.on('connection', (ws) => {
+wss.on("connection", (ws) => {
   wsClients.add(ws);
   const activeWorkers = {};
   for (const [id, w] of Object.entries(state.workers)) {
-    if (w.state === 'walking' || w.state === 'working') {
+    if (w.state === "walking" || w.state === "working") {
       activeWorkers[id] = w;
     }
   }
   const filteredState = { ...state, workers: activeWorkers };
-  ws.send(JSON.stringify({ type: 'full_state', data: filteredState }));
+  ws.send(JSON.stringify({ type: "full_state", data: filteredState }));
 
-  ws.on('message', (raw) => {
+  ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw);
-      if (msg.type === 'user_message' && msg.data) {
-        if (msg.data.type === 'cancel_task' && msg.data.workerId) {
+      if (msg.type === "user_message" && msg.data) {
+        if (msg.data.type === "cancel_task" && msg.data.workerId) {
           const w = state.workers[msg.data.workerId];
-          if (w && (w.state === 'walking' || w.state === 'working')) {
-            w.state = 'finished';
-            w.result = 'cancelled';
+          if (w && (w.state === "walking" || w.state === "working")) {
+            w.state = "finished";
+            w.result = "cancelled";
             w.finishTime = Date.now();
-            if (state.servers[w.target]) state.servers[w.target]._active = false;
-            broadcast({ type: 'worker_done', workerId: w.id, result: 'error' });
-            broadcast({ type: 'worker_say', workerId: w.id, text: '已取消' });
+            if (state.servers[w.target])
+              state.servers[w.target]._active = false;
+            broadcast({ type: "worker_done", workerId: w.id, result: "error" });
+            broadcast({ type: "worker_say", workerId: w.id, text: "已取消" });
           }
         }
-        pendingMessages.push({ ...msg.data, timestamp: Date.now() });
+        const wsMsg = {
+          ...msg.data,
+          timestamp: Date.now(),
+          _id: ++messageIdCounter,
+        };
+        pendingMessages.push(wsMsg);
+        persistMessages();
       }
-    } catch (e) { /* ignore bad messages */ }
+    } catch (e) {
+      /* ignore bad messages */
+    }
   });
 
-  ws.on('close', () => wsClients.delete(ws));
+  ws.on("close", () => wsClients.delete(ws));
 });
 
 function broadcast(payload) {
@@ -74,14 +122,15 @@ function broadcast(payload) {
 
 // ─── REST API ───
 
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), clients: wsClients.size });
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", uptime: process.uptime(), clients: wsClients.size });
 });
 
 // Initialize entities (servers/datasets/etc)
-app.post('/api/server/init', (req, res) => {
+app.post("/api/server/init", (req, res) => {
   const servers = Array.isArray(req.body) ? req.body : req.body.servers;
-  if (!Array.isArray(servers)) return res.status(400).json({ error: 'servers must be array' });
+  if (!Array.isArray(servers))
+    return res.status(400).json({ error: "servers must be array" });
 
   state.servers = {};
   state.groups = {};
@@ -90,162 +139,214 @@ app.post('/api/server/init', (req, res) => {
     if (!state.groups[s.group]) state.groups[s.group] = [];
     state.groups[s.group].push(s.alias);
   }
-  broadcast({ type: 'init_servers', servers });
+  broadcast({ type: "init_servers", servers });
   res.json({ success: true, count: servers.length });
 });
 
 // Update entity status
-app.post('/api/server/:alias/status', (req, res) => {
+app.post("/api/server/:alias/status", (req, res) => {
   const { alias } = req.params;
-  if (!state.servers[alias]) return res.status(404).json({ error: 'server not found' });
+  if (!state.servers[alias])
+    return res.status(404).json({ error: "server not found" });
   state.servers[alias].metrics = req.body;
-  broadcast({ type: 'server_status', alias, metrics: req.body });
+  broadcast({ type: "server_status", alias, metrics: req.body });
   res.json({ success: true });
 });
 
 // Spawn worker
-app.post('/api/worker/spawn', (req, res) => {
+app.post("/api/worker/spawn", (req, res) => {
   const { type, target, label } = req.body;
-  if (!type || !target) return res.status(400).json({ error: 'type and target required' });
+  if (!type || !target)
+    return res.status(400).json({ error: "type and target required" });
 
   state.workerIdCounter++;
   const workerId = `w${state.workerIdCounter}`;
   state.workers[workerId] = {
-    id: workerId, type, target, label: label || type,
-    state: 'walking', termLines: [], bubble: '',
+    id: workerId,
+    type,
+    target,
+    label: label || type,
+    state: "walking",
+    termLines: [],
+    bubble: "",
     startTime: Date.now(),
   };
   if (state.servers[target]) state.servers[target]._active = true;
-  broadcast({ type: 'worker_spawn', worker: state.workers[workerId] });
+  broadcast({ type: "worker_spawn", worker: state.workers[workerId] });
   res.json({ success: true, workerId });
 });
 
 // Worker say
-app.post('/api/worker/:id/say', (req, res) => {
+app.post("/api/worker/:id/say", (req, res) => {
   const w = state.workers[req.params.id];
-  if (!w) return res.status(404).json({ error: 'worker not found' });
-  w.bubble = req.body.text || '';
-  broadcast({ type: 'worker_say', workerId: w.id, text: w.bubble });
+  if (!w) return res.status(404).json({ error: "worker not found" });
+  w.bubble = req.body.text || "";
+  broadcast({ type: "worker_say", workerId: w.id, text: w.bubble });
   res.json({ success: true });
 });
 
 // Worker terminal write
-app.post('/api/worker/:id/term', (req, res) => {
+app.post("/api/worker/:id/term", (req, res) => {
   const w = state.workers[req.params.id];
-  if (!w) return res.status(404).json({ error: 'worker not found' });
+  if (!w) return res.status(404).json({ error: "worker not found" });
   const { type: termType, text } = req.body;
-  w.termLines.push({ type: termType || 'output', text: text || '' });
+  w.termLines.push({ type: termType || "output", text: text || "" });
   if (w.termLines.length > 200) w.termLines = w.termLines.slice(-100);
-  broadcast({ type: 'term_write', workerId: w.id, termType: termType || 'output', text: text || '' });
+  broadcast({
+    type: "term_write",
+    workerId: w.id,
+    termType: termType || "output",
+    text: text || "",
+  });
   res.json({ success: true });
 });
 
 // Worker done
-app.post('/api/worker/:id/done', (req, res) => {
+app.post("/api/worker/:id/done", (req, res) => {
   const w = state.workers[req.params.id];
-  if (!w) return res.status(404).json({ error: 'worker not found' });
-  w.state = 'finished';
-  w.result = req.body.result || 'success';
+  if (!w) return res.status(404).json({ error: "worker not found" });
+  w.state = "finished";
+  w.result = req.body.result || "success";
   w.finishTime = Date.now();
-  const duration = w.startTime ? Math.round((w.finishTime - w.startTime) / 100) / 10 : 0;
+  const duration = w.startTime
+    ? Math.round((w.finishTime - w.startTime) / 100) / 10
+    : 0;
 
   historyIdCounter++;
   const entry = {
     id: `h${historyIdCounter}`,
-    workerId: w.id, server: w.target, type: w.type, label: w.label,
-    startTime: w.startTime || w.finishTime, endTime: w.finishTime,
-    duration, result: w.result,
-    termLines: [...w.termLines], summary: req.body.summary || '',
+    workerId: w.id,
+    server: w.target,
+    type: w.type,
+    label: w.label,
+    startTime: w.startTime || w.finishTime,
+    endTime: w.finishTime,
+    duration,
+    result: w.result,
+    termLines: [...w.termLines],
+    summary: req.body.summary || "",
   };
   history.push(entry);
-  if (history.length > HISTORY_MAX) history.splice(0, history.length - HISTORY_MAX);
+  if (history.length > HISTORY_MAX)
+    history.splice(0, history.length - HISTORY_MAX);
 
-  broadcast({ type: 'worker_done', workerId: w.id, result: w.result });
-  broadcast({ type: 'history_add', entry });
+  broadcast({ type: "worker_done", workerId: w.id, result: w.result });
+  broadcast({ type: "history_add", entry });
   res.json({ success: true });
 });
 
 // Worker cancel
-app.post('/api/worker/:id/cancel', (req, res) => {
+app.post("/api/worker/:id/cancel", (req, res) => {
   const w = state.workers[req.params.id];
-  if (!w) return res.status(404).json({ error: 'worker not found' });
-  w.state = 'finished';
-  w.result = 'cancelled';
+  if (!w) return res.status(404).json({ error: "worker not found" });
+  w.state = "finished";
+  w.result = "cancelled";
   w.finishTime = Date.now();
-  w.bubble = '已取消';
+  w.bubble = "已取消";
   if (state.servers[w.target]) state.servers[w.target]._active = false;
 
   historyIdCounter++;
   const entry = {
     id: `h${historyIdCounter}`,
-    workerId: w.id, server: w.target, type: w.type, label: w.label,
-    startTime: w.startTime || w.finishTime, endTime: w.finishTime,
-    duration: w.startTime ? Math.round((w.finishTime - w.startTime) / 100) / 10 : 0,
-    result: 'cancelled', termLines: [...w.termLines], summary: '用户取消',
+    workerId: w.id,
+    server: w.target,
+    type: w.type,
+    label: w.label,
+    startTime: w.startTime || w.finishTime,
+    endTime: w.finishTime,
+    duration: w.startTime
+      ? Math.round((w.finishTime - w.startTime) / 100) / 10
+      : 0,
+    result: "cancelled",
+    termLines: [...w.termLines],
+    summary: "用户取消",
   };
   history.push(entry);
-  if (history.length > HISTORY_MAX) history.splice(0, history.length - HISTORY_MAX);
+  if (history.length > HISTORY_MAX)
+    history.splice(0, history.length - HISTORY_MAX);
 
-  broadcast({ type: 'worker_done', workerId: w.id, result: 'error' });
-  broadcast({ type: 'worker_say', workerId: w.id, text: '已取消' });
-  broadcast({ type: 'history_add', entry });
+  broadcast({ type: "worker_done", workerId: w.id, result: "error" });
+  broadcast({ type: "worker_say", workerId: w.id, text: "已取消" });
+  broadcast({ type: "history_add", entry });
   res.json({ success: true });
 });
 
 // Worker remove
-app.post('/api/worker/:id/remove', (req, res) => {
+app.post("/api/worker/:id/remove", (req, res) => {
   const w = state.workers[req.params.id];
-  if (!w) return res.status(404).json({ error: 'worker not found' });
-  w.state = 'walking_back';
+  if (!w) return res.status(404).json({ error: "worker not found" });
+  w.state = "walking_back";
   w.finishTime = w.finishTime || Date.now();
   if (state.servers[w.target]) state.servers[w.target]._active = false;
-  broadcast({ type: 'worker_remove', workerId: w.id });
+  broadcast({ type: "worker_remove", workerId: w.id });
   res.json({ success: true });
 });
 
 // Operation banner
-app.post('/api/operation', (req, res) => {
+app.post("/api/operation", (req, res) => {
   state.operation = req.body.description ? req.body : null;
-  broadcast({ type: 'operation', description: req.body.description || null, opType: req.body.type || '' });
+  broadcast({
+    type: "operation",
+    description: req.body.description || null,
+    opType: req.body.type || "",
+  });
   res.json({ success: true });
 });
 
 // Progress
-app.post('/api/progress', (req, res) => {
+app.post("/api/progress", (req, res) => {
   state.progress = req.body;
-  broadcast({ type: 'progress', ...req.body });
+  broadcast({ type: "progress", ...req.body });
   res.json({ success: true });
 });
 
-// Claude status
-app.post('/api/claude/status', (req, res) => {
-  state.claudeStatus = req.body.status || 'idle';
-  broadcast({ type: 'claude_status', status: state.claudeStatus });
+// Claude status (read)
+app.get("/api/claude/status", (_req, res) => {
+  res.json({ status: state.claudeStatus });
+});
+
+// Claude status (write)
+app.post("/api/claude/status", (req, res) => {
+  state.claudeStatus = req.body.status || "idle";
+  broadcast({ type: "claude_status", status: state.claudeStatus });
   res.json({ success: true });
 });
 
-// Get messages (for Claude to poll)
-app.get('/api/messages', (_req, res) => {
-  const messages = [...pendingMessages];
-  pendingMessages = [];
-  res.json({ messages });
+// Get messages (peek — non-destructive read)
+app.get("/api/messages", (_req, res) => {
+  res.json({ messages: [...pendingMessages] });
+});
+
+// Acknowledge processed messages (clear up to a given _id, or all)
+app.post("/api/messages/ack", (req, res) => {
+  const { upToId } = req.body || {};
+  if (upToId) {
+    pendingMessages = pendingMessages.filter((m) => (m._id || 0) > upToId);
+  } else {
+    pendingMessages = [];
+  }
+  persistMessages();
+  res.json({ success: true, remaining: pendingMessages.length });
 });
 
 // Post message to queue (for plugins/external scripts)
-app.post('/api/messages', (req, res) => {
+app.post("/api/messages", (req, res) => {
   const msg = req.body;
   if (!msg || !msg.type) {
-    return res.status(400).json({ error: 'message must have a type field' });
+    return res.status(400).json({ error: "message must have a type field" });
   }
   msg.timestamp = msg.timestamp || Date.now();
+  msg._id = ++messageIdCounter;
   pendingMessages.push(msg);
-  broadcast({ type: 'external_message', data: msg });
-  res.json({ success: true });
+  persistMessages();
+  broadcast({ type: "external_message", data: msg });
+  res.json({ success: true, _id: msg._id });
 });
 
 // Clear messages
-app.delete('/api/messages', (_req, res) => {
+app.delete("/api/messages", (_req, res) => {
   pendingMessages = [];
+  persistMessages();
   res.json({ success: true });
 });
 
@@ -253,27 +354,40 @@ app.delete('/api/messages', (_req, res) => {
 
 function checkPid(pidFile) {
   try {
-    const pid = fs.readFileSync(pidFile, 'utf8').trim();
+    const pid = fs.readFileSync(pidFile, "utf8").trim();
     process.kill(parseInt(pid), 0);
     return { running: true, pid };
-  } catch { return { running: false, pid: null }; }
+  } catch {
+    return { running: false, pid: null };
+  }
 }
 
 function discoverPlugins() {
-  const pluginsDir = path.join(__dirname, '..', 'plugins');
+  const pluginsDir = path.join(__dirname, "..", "plugins");
   const plugins = [];
   try {
-    const dirs = fs.readdirSync(pluginsDir, { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('_'));
+    const dirs = fs
+      .readdirSync(pluginsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith("_"));
     for (const d of dirs) {
-      const manifestFile = path.join(pluginsDir, d.name, 'PLUGIN.md');
+      const manifestFile = path.join(pluginsDir, d.name, "PLUGIN.md");
       try {
-        const content = fs.readFileSync(manifestFile, 'utf8');
-        const fm = content.match(/^---\n([\s\S]*?)\n---/)?.[1] || '';
+        const content = fs.readFileSync(manifestFile, "utf8");
+        const fm = content.match(/^---\n([\s\S]*?)\n---/)?.[1] || "";
         const name = fm.match(/name:\s*(.+)/)?.[1]?.trim() || d.name;
-        const desc = fm.match(/description:\s*["']?(.+?)["']?\s*$/m)?.[1]?.trim() || '';
-        const interval = parseInt(fm.match(/interval:\s*(\d+)/)?.[1] || '0');
-        const pidFile = fm.match(/pid_file:\s*(.+)/)?.[1]?.trim() || `/tmp/claude-${d.name}.pid`;
-        plugins.push({ name, dirName: d.name, description: desc, interval, pidFile });
+        const desc =
+          fm.match(/description:\s*["']?(.+?)["']?\s*$/m)?.[1]?.trim() || "";
+        const interval = parseInt(fm.match(/interval:\s*(\d+)/)?.[1] || "0");
+        const pidFile =
+          fm.match(/pid_file:\s*(.+)/)?.[1]?.trim() ||
+          `/tmp/claude-${d.name}.pid`;
+        plugins.push({
+          name,
+          dirName: d.name,
+          description: desc,
+          interval,
+          pidFile,
+        });
       } catch {}
     }
   } catch {}
@@ -281,102 +395,163 @@ function discoverPlugins() {
 }
 
 // Plugin status — all background plugins
-app.get('/api/cron/status', (_req, res) => {
+app.get("/api/cron/status", (_req, res) => {
   const plugins = discoverPlugins();
-  const poll = checkPid('/tmp/claude-dashboard-poll.pid');
+  const poll = checkPid(
+    `/tmp/claude-${path.basename(path.join(__dirname, ".."))}-dashboard-poll.pid`,
+  );
 
-  const tasks = plugins.map(p => {
+  const tasks = plugins.map((p) => {
     const status = checkPid(p.pidFile);
     return {
-      name: p.name, type: p.dirName, running: status.running,
-      pid: status.pid, interval: p.interval,
+      name: p.name,
+      type: p.dirName,
+      running: status.running,
+      pid: status.pid,
+      interval: p.interval,
     };
   });
 
-  tasks.push({ name: 'Dashboard 轮询', type: 'dashboard-poll', running: poll.running, pid: poll.pid, interval: 3 });
+  tasks.push({
+    name: "Dashboard 轮询",
+    type: "dashboard-poll",
+    running: poll.running,
+    pid: poll.pid,
+    interval: 3,
+  });
   res.json({ tasks });
 });
 
 // ─── Knowledge Base API ───
 
-app.get('/api/knowledge', (_req, res) => {
-  const knowledgeDir = path.join(__dirname, '..', 'memory', 'knowledge');
+app.get("/api/knowledge", (_req, res) => {
+  const knowledgeDir = path.join(__dirname, "..", "memory", "knowledge");
   const files = [];
   try {
-    const entries = fs.readdirSync(knowledgeDir).filter(f => f.endsWith('.md') && f !== '_index.md');
+    const entries = fs
+      .readdirSync(knowledgeDir)
+      .filter((f) => f.endsWith(".md") && f !== "_index.md");
     for (const f of entries) {
       const stat = fs.statSync(path.join(knowledgeDir, f));
-      files.push({ name: f.replace('.md', ''), file: f, lastModified: stat.mtime.toISOString() });
+      files.push({
+        name: f.replace(".md", ""),
+        file: f,
+        lastModified: stat.mtime.toISOString(),
+      });
     }
   } catch {}
   res.json({ files });
 });
 
-app.get('/api/knowledge/:topic', (req, res) => {
-  const knowledgeFile = path.join(__dirname, '..', 'memory', 'knowledge', `${req.params.topic}.md`);
+app.get("/api/knowledge/:topic", (req, res) => {
+  const knowledgeFile = path.join(
+    __dirname,
+    "..",
+    "memory",
+    "knowledge",
+    `${req.params.topic}.md`,
+  );
   try {
-    const content = fs.readFileSync(knowledgeFile, 'utf8');
+    const content = fs.readFileSync(knowledgeFile, "utf8");
     res.json({ topic: req.params.topic, content });
   } catch {
-    res.status(404).json({ error: 'knowledge file not found' });
+    res.status(404).json({ error: "knowledge file not found" });
   }
 });
 
 // ─── Memory / Skills / History APIs ───
 
-app.get('/api/memory', (_req, res) => {
-  const memDir = path.join(__dirname, '..', 'memory');
-  const skip = ['_template.md', 'PROJECT_MEMORY.md'];
+app.get("/api/memory", (_req, res) => {
+  const memDir = path.join(__dirname, "..", "memory");
+  const skip = ["_template.md", "PROJECT_MEMORY.md"];
   const memories = [];
 
   try {
-    const files = fs.readdirSync(memDir).filter(f => f.endsWith('.md') && !skip.includes(f));
+    const files = fs
+      .readdirSync(memDir)
+      .filter((f) => f.endsWith(".md") && !skip.includes(f));
     for (const f of files) {
-      const alias = f.replace('.md', '');
-      const content = fs.readFileSync(path.join(memDir, f), 'utf8');
+      const alias = f.replace(".md", "");
+      const content = fs.readFileSync(path.join(memDir, f), "utf8");
 
-      const lastProbe = content.match(/\*\*最后探测\*\*:\s*(.+)/)?.[1]?.trim() || null;
+      const lastProbe =
+        content.match(/\*\*最后探测\*\*:\s*(.+)/)?.[1]?.trim() || null;
       const os = content.match(/\*\*操作系统\*\*:\s*(.+)/)?.[1]?.trim() || null;
-      const cpuCores = content.match(/\*\*CPU 核心\*\*:\s*(.+)/)?.[1]?.trim() || null;
-      const memTotal = content.match(/\*\*内存总量\*\*:\s*(.+)/)?.[1]?.trim() || null;
+      const cpuCores =
+        content.match(/\*\*CPU 核心\*\*:\s*(.+)/)?.[1]?.trim() || null;
+      const memTotal =
+        content.match(/\*\*内存总量\*\*:\s*(.+)/)?.[1]?.trim() || null;
 
-      const issueSection = content.match(/## 已知问题[^\n]*\n([\s\S]*?)(?=\n## |$)/)?.[1] || '';
-      const issues = issueSection.match(/- \*\*(.+?)\*\*/g)?.map(m => m.replace(/- \*\*|\*\*/g, '')) || [];
+      const issueSection =
+        content.match(/## 已知问题[^\n]*\n([\s\S]*?)(?=\n## |$)/)?.[1] || "";
+      const issues =
+        issueSection
+          .match(/- \*\*(.+?)\*\*/g)
+          ?.map((m) => m.replace(/- \*\*|\*\*/g, "")) || [];
 
-      const opHistory = content.match(/## 操作历史[^\n]*\n[\s\S]*?\n\|[\s|:-]+\n([\s\S]*?)(?=\n## |$)/)?.[1] || '';
-      const opLines = opHistory.trim().split('\n').filter(l => l.startsWith('|'));
-      const lastOp = opLines.length > 0 ? opLines[opLines.length - 1].split('|').filter(Boolean).map(s => s.trim()).slice(0, 2).join(' ') : null;
+      const opHistory =
+        content.match(
+          /## 操作历史[^\n]*\n[\s\S]*?\n\|[\s|:-]+\n([\s\S]*?)(?=\n## |$)/,
+        )?.[1] || "";
+      const opLines = opHistory
+        .trim()
+        .split("\n")
+        .filter((l) => l.startsWith("|"));
+      const lastOp =
+        opLines.length > 0
+          ? opLines[opLines.length - 1]
+              .split("|")
+              .filter(Boolean)
+              .map((s) => s.trim())
+              .slice(0, 2)
+              .join(" ")
+          : null;
 
-      memories.push({ alias, lastProbe, os, cpuCores, memTotal, issues, lastOp });
+      memories.push({
+        alias,
+        lastProbe,
+        os,
+        cpuCores,
+        memTotal,
+        issues,
+        lastOp,
+      });
     }
   } catch {}
 
   res.json({ memories });
 });
 
-app.get('/api/memory/:alias', (req, res) => {
-  const memFile = path.join(__dirname, '..', 'memory', `${req.params.alias}.md`);
+app.get("/api/memory/:alias", (req, res) => {
+  const memFile = path.join(
+    __dirname,
+    "..",
+    "memory",
+    `${req.params.alias}.md`,
+  );
   try {
-    const content = fs.readFileSync(memFile, 'utf8');
+    const content = fs.readFileSync(memFile, "utf8");
     res.json({ alias: req.params.alias, content });
   } catch {
-    res.status(404).json({ error: 'memory file not found' });
+    res.status(404).json({ error: "memory file not found" });
   }
 });
 
-app.get('/api/skills', (_req, res) => {
-  const skillsDir = path.join(__dirname, '..', 'skills');
+app.get("/api/skills", (_req, res) => {
+  const skillsDir = path.join(__dirname, "..", "skills");
   const skills = [];
 
   try {
-    const dirs = fs.readdirSync(skillsDir, { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('_'));
+    const dirs = fs
+      .readdirSync(skillsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith("_"));
     for (const d of dirs) {
-      const skillFile = path.join(skillsDir, d.name, 'SKILL.md');
+      const skillFile = path.join(skillsDir, d.name, "SKILL.md");
       try {
-        const content = fs.readFileSync(skillFile, 'utf8');
-        const fm = content.match(/^---\n([\s\S]*?)\n---/)?.[1] || '';
+        const content = fs.readFileSync(skillFile, "utf8");
+        const fm = content.match(/^---\n([\s\S]*?)\n---/)?.[1] || "";
         const name = fm.match(/name:\s*(.+)/)?.[1]?.trim() || d.name;
-        const desc = fm.match(/description:\s*(.+)/)?.[1]?.trim() || '';
+        const desc = fm.match(/description:\s*(.+)/)?.[1]?.trim() || "";
         skills.push({ name, description: desc.slice(0, 100) });
       } catch {}
     }
@@ -386,14 +561,16 @@ app.get('/api/skills', (_req, res) => {
 });
 
 // Plugin list (for Dashboard skills panel)
-app.get('/api/plugins', (_req, res) => {
+app.get("/api/plugins", (_req, res) => {
   res.json({ plugins: discoverPlugins() });
 });
 
-app.get('/api/history', (req, res) => {
+app.get("/api/history", (req, res) => {
   let results = [...history];
-  if (req.query.server) results = results.filter(h => h.server === req.query.server);
-  if (req.query.type) results = results.filter(h => h.type === req.query.type);
+  if (req.query.server)
+    results = results.filter((h) => h.server === req.query.server);
+  if (req.query.type)
+    results = results.filter((h) => h.type === req.query.type);
   results.reverse();
   const limit = parseInt(req.query.limit) || 50;
   results = results.slice(0, limit);
@@ -404,29 +581,48 @@ app.get('/api/history', (req, res) => {
 // Worker 生命周期 5 阶段: online → busy → progress → idle → error
 // Lead 通过 GET /api/worker/states "读账本"做恢复决策
 
-let teamWorkers = {};  // { workerName: lastHeartbeat }
+let teamWorkers = {}; // { workerName: lastHeartbeat }
 let teamExpectedCount = parseInt(process.env.TEAM_WORKER_COUNT) || 4;
-let workerStates = {};  // { workerName: { status, task, progress, error, startedAt, lastUpdate } }
-const WORKER_STATES_FILE = path.join(__dirname, '..', 'data', 'worker-states.json');
+let workerStates = {}; // { workerName: { status, task, progress, error, startedAt, lastUpdate } }
+const WORKER_STATES_FILE = path.join(
+  __dirname,
+  "..",
+  "data",
+  "worker-states.json",
+);
 
 // 启动时加载持久化的 Worker 状态
 try {
   if (fs.existsSync(WORKER_STATES_FILE)) {
-    workerStates = JSON.parse(fs.readFileSync(WORKER_STATES_FILE, 'utf8'));
+    workerStates = JSON.parse(fs.readFileSync(WORKER_STATES_FILE, "utf8"));
   }
-} catch (_) { /* ignore */ }
+} catch (_) {
+  /* ignore */
+}
 
 function persistWorkerStates() {
-  try { fs.writeFileSync(WORKER_STATES_FILE, JSON.stringify(workerStates, null, 2)); } catch (_) { /* ignore */ }
+  try {
+    fs.writeFileSync(WORKER_STATES_FILE, JSON.stringify(workerStates, null, 2));
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 // Heartbeat — Worker 启动时 + 完成任务时调用
-app.post('/api/team/heartbeat', (req, res) => {
+app.post("/api/team/heartbeat", (req, res) => {
   const { worker_name } = req.body;
-  if (!worker_name) return res.status(400).json({ error: 'worker_name required' });
+  if (!worker_name)
+    return res.status(400).json({ error: "worker_name required" });
   teamWorkers[worker_name] = Date.now();
   if (!workerStates[worker_name]) {
-    workerStates[worker_name] = { status: 'online', task: null, progress: null, error: null, startedAt: null, lastUpdate: Date.now() };
+    workerStates[worker_name] = {
+      status: "online",
+      task: null,
+      progress: null,
+      error: null,
+      startedAt: null,
+      lastUpdate: Date.now(),
+    };
   } else {
     workerStates[worker_name].lastUpdate = Date.now();
   }
@@ -435,23 +631,32 @@ app.post('/api/team/heartbeat', (req, res) => {
 });
 
 // Health check — Lead 读取全局 Worker 状态
-app.get('/api/team/health', (_req, res) => {
+app.get("/api/team/health", (_req, res) => {
   const now = Date.now();
   const staleThreshold = 1800000; // 30 分钟无心跳视为 dead
-  const alive = Object.entries(teamWorkers).filter(([_, ts]) => now - ts < staleThreshold);
-  const dead = Object.entries(teamWorkers).filter(([_, ts]) => now - ts >= staleThreshold);
+  const alive = Object.entries(teamWorkers).filter(
+    ([_, ts]) => now - ts < staleThreshold,
+  );
+  const dead = Object.entries(teamWorkers).filter(
+    ([_, ts]) => now - ts >= staleThreshold,
+  );
   res.json({
     expected: teamExpectedCount,
     alive: alive.length,
     aliveNames: alive.map(([name]) => name),
     dead: dead.map(([name]) => name),
-    workers: Object.fromEntries(Object.entries(teamWorkers).map(([n, ts]) => [n, { lastHeartbeat: ts, stale: now - ts >= staleThreshold }])),
+    workers: Object.fromEntries(
+      Object.entries(teamWorkers).map(([n, ts]) => [
+        n,
+        { lastHeartbeat: ts, stale: now - ts >= staleThreshold },
+      ]),
+    ),
     workerStates,
   });
 });
 
 // Reset — Team 重建时清空
-app.post('/api/team/reset', (_req, res) => {
+app.post("/api/team/reset", (_req, res) => {
   teamWorkers = {};
   workerStates = {};
   persistWorkerStates();
@@ -460,28 +665,36 @@ app.post('/api/team/reset', (_req, res) => {
 
 // Deregister — Worker shutdown 后调用，从心跳表移除，标记 status=shutdown
 // 防止已 shutdown 的 Worker 被代发心跳"假复活"
-app.post('/api/team/deregister', (req, res) => {
+app.post("/api/team/deregister", (req, res) => {
   const { worker_name } = req.body;
-  if (!worker_name) return res.status(400).json({ error: 'worker_name required' });
+  if (!worker_name)
+    return res.status(400).json({ error: "worker_name required" });
   delete teamWorkers[worker_name];
   if (workerStates[worker_name]) {
-    workerStates[worker_name] = { status: 'shutdown', task: null, progress: null, error: null, startedAt: null, lastUpdate: Date.now() };
+    workerStates[worker_name] = {
+      status: "shutdown",
+      task: null,
+      progress: null,
+      error: null,
+      startedAt: null,
+      lastUpdate: Date.now(),
+    };
   }
   persistWorkerStates();
   res.json({ success: true });
 });
 
 // Worker 状态上报 — 5 阶段生命周期
-app.post('/api/worker/state', (req, res) => {
+app.post("/api/worker/state", (req, res) => {
   const { name, status, task, progress, error } = req.body;
-  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!name) return res.status(400).json({ error: "name required" });
   const now = Date.now();
   workerStates[name] = {
-    status: status || 'online',
+    status: status || "online",
     task: task || null,
     progress: progress || null,
     error: error || null,
-    startedAt: status === 'busy' ? (workerStates[name]?.startedAt || now) : null,
+    startedAt: status === "busy" ? workerStates[name]?.startedAt || now : null,
     lastUpdate: now,
   };
   teamWorkers[name] = now; // 状态上报视为心跳
@@ -490,14 +703,14 @@ app.post('/api/worker/state', (req, res) => {
 });
 
 // Lead 读取所有 Worker 状态（"读账本"）
-app.get('/api/worker/states', (_req, res) => {
+app.get("/api/worker/states", (_req, res) => {
   res.json(workerStates);
 });
 
 // 查询特定 Worker 状态
-app.get('/api/worker/state/:name', (req, res) => {
+app.get("/api/worker/state/:name", (req, res) => {
   const ws = workerStates[req.params.name];
-  if (!ws) return res.status(404).json({ error: 'worker not found' });
+  if (!ws) return res.status(404).json({ error: "worker not found" });
   res.json(ws);
 });
 
@@ -514,40 +727,53 @@ function cleanExpiredClaims() {
 }
 
 // Claim a learning topic (prevents multi-Worker duplication)
-app.post('/api/learning/claim', (req, res) => {
+app.post("/api/learning/claim", (req, res) => {
   cleanExpiredClaims();
   const { topic, worker_name } = req.body;
-  if (!topic) return res.status(400).json({ error: 'topic required' });
+  if (!topic) return res.status(400).json({ error: "topic required" });
   if (claimedTopics[topic]) {
-    return res.json({ success: false, claimed_by: claimedTopics[topic].worker });
+    return res.json({
+      success: false,
+      claimed_by: claimedTopics[topic].worker,
+    });
   }
-  claimedTopics[topic] = { worker: worker_name || 'unknown', claimedAt: Date.now() };
+  claimedTopics[topic] = {
+    worker: worker_name || "unknown",
+    claimedAt: Date.now(),
+  };
   res.json({ success: true });
 });
 
 // Release a learning topic
-app.post('/api/learning/release', (req, res) => {
+app.post("/api/learning/release", (req, res) => {
   const { topic } = req.body;
-  if (!topic) return res.status(400).json({ error: 'topic required' });
+  if (!topic) return res.status(400).json({ error: "topic required" });
   delete claimedTopics[topic];
   res.json({ success: true });
 });
 
 // List current claims
-app.get('/api/learning/claims', (_req, res) => {
+app.get("/api/learning/claims", (_req, res) => {
   cleanExpiredClaims();
   res.json({ claims: claimedTopics });
 });
 
 // Recover stale learning topics (learning > 24h → pending)
-app.post('/api/learning/recover', (_req, res) => {
-  const queueFile = path.join(__dirname, '..', 'memory', 'knowledge', 'learning-queue.md');
+app.post("/api/learning/recover", (_req, res) => {
+  const queueFile = path.join(
+    __dirname,
+    "..",
+    "memory",
+    "knowledge",
+    "learning-queue.md",
+  );
   try {
     if (!fs.existsSync(queueFile)) return res.json({ recovered: 0 });
-    let content = fs.readFileSync(queueFile, 'utf8');
+    let content = fs.readFileSync(queueFile, "utf8");
     const today = new Date().toISOString().slice(0, 10);
     let recovered = 0;
-    content = content.replace(/\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\| learning \|/g,
+    content = content.replace(
+      /\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\| learning \|/g,
       (match, p1, p2, p3, dateCol) => {
         const date = dateCol.trim();
         if (date && date < today) {
@@ -555,7 +781,8 @@ app.post('/api/learning/recover', (_req, res) => {
           return `|${p1}|${p2}|${p3}|${dateCol}| pending |`;
         }
         return match;
-      });
+      },
+    );
     if (recovered > 0) fs.writeFileSync(queueFile, content);
     res.json({ recovered, today });
   } catch (e) {
@@ -565,18 +792,23 @@ app.post('/api/learning/recover', (_req, res) => {
 
 // ─── Plugin Route Mounting ───
 (function mountPluginRoutes() {
-  const pluginsDir = path.join(__dirname, '..', 'plugins');
+  const pluginsDir = path.join(__dirname, "..", "plugins");
   try {
-    const dirs = fs.readdirSync(pluginsDir, { withFileTypes: true }).filter(d => d.isDirectory() && !d.name.startsWith('_'));
+    const dirs = fs
+      .readdirSync(pluginsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith("_"));
     for (const d of dirs) {
-      const routesFile = path.join(pluginsDir, d.name, 'routes.js');
+      const routesFile = path.join(pluginsDir, d.name, "routes.js");
       if (fs.existsSync(routesFile)) {
         try {
           const router = require(routesFile);
           app.use(`/api/plugin/${d.name}`, router);
           console.log(`Plugin route mounted: /api/plugin/${d.name}`);
         } catch (e) {
-          console.error(`Failed to mount plugin routes for ${d.name}:`, e.message);
+          console.error(
+            `Failed to mount plugin routes for ${d.name}:`,
+            e.message,
+          );
         }
       }
     }
@@ -587,7 +819,11 @@ app.post('/api/learning/recover', (_req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [id, w] of Object.entries(state.workers)) {
-    if ((w.state === 'finished' || w.state === 'walking_back') && w.finishTime && (now - w.finishTime > 60000)) {
+    if (
+      (w.state === "finished" || w.state === "walking_back") &&
+      w.finishTime &&
+      now - w.finishTime > 60000
+    ) {
       delete state.workers[id];
     }
   }
@@ -596,13 +832,25 @@ setInterval(() => {
 // ─── Plugin Status Broadcast (every 30s) ───
 setInterval(() => {
   const plugins = discoverPlugins();
-  const poll = checkPid('/tmp/claude-dashboard-poll.pid');
-  const tasks = plugins.map(p => {
+  const poll = checkPid(
+    `/tmp/claude-${path.basename(path.join(__dirname, ".."))}-dashboard-poll.pid`,
+  );
+  const tasks = plugins.map((p) => {
     const status = checkPid(p.pidFile);
-    return { name: p.name, type: p.dirName, running: status.running, interval: p.interval };
+    return {
+      name: p.name,
+      type: p.dirName,
+      running: status.running,
+      interval: p.interval,
+    };
   });
-  tasks.push({ name: 'Dashboard 轮询', type: 'dashboard-poll', running: poll.running, interval: 3 });
-  broadcast({ type: 'cron_status', tasks });
+  tasks.push({
+    name: "Dashboard 轮询",
+    type: "dashboard-poll",
+    running: poll.running,
+    interval: 3,
+  });
+  broadcast({ type: "cron_status", tasks });
 }, 30000);
 
 // ─── Start ───
