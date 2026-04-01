@@ -1,12 +1,13 @@
 #!/bin/bash
 # Dashboard 消息轮询后台脚本
-# 正常模式（DAEMON_MODE=0）：每 3 秒检查消息队列，发现消息后合并输出并退出唤醒 Claude
-# 守护模式（DAEMON_MODE=1）：跳过消息轮询（不消费队列），只维持心跳 + Worker 健康检查
-# 每 60 秒检查 Team Worker 心跳，缺失时注入 ping_worker 消息
+# 正常模式（DAEMON_MODE=0）：每 3 秒 peek 消息队列（不消费），发现消息后写入本地文件并退出唤醒 Claude
+# 守护模式（DAEMON_MODE=1）：跳过消息轮询，只维持心跳 + Worker 健康检查
+# Claude 处理完消息后调用 POST /api/messages/ack 确认清除
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 POLL_PID_FILE="/tmp/claude-${PROJECT_NAME}-dashboard-poll.pid"
+PENDING_FILE="$PROJECT_DIR/data/pending-messages.json"
 
 # 加载项目 .env（确保读到正确的 DASHBOARD_PORT）
 [ -f "$PROJECT_DIR/.env" ] && { set -a; source "$PROJECT_DIR/.env"; set +a; }
@@ -24,29 +25,39 @@ LAST_HEALTH_CHECK=$(date +%s)
 LAST_PING_TIME=0
 PING_COOLDOWN=3600  # 1 小时内不重复 ping 同一个 worker
 
+# ─── 启动时检查本地缓存的未处理消息 ───
+if [ "$DAEMON_MODE" != "1" ] && [ -f "$PENDING_FILE" ] && [ -s "$PENDING_FILE" ]; then
+  pending=$(cat "$PENDING_FILE")
+  count=$(echo "$pending" | jq 'length' 2>/dev/null)
+  if [ "$count" -gt "0" ] 2>/dev/null; then
+    echo "=== 本地缓存的未处理消息 (共 ${count} 条) ==="
+    echo "$pending" | jq '.[]'
+    rm -f "$POLL_PID_FILE"
+    exit 0
+  fi
+fi
+
 while true; do
 
-  # 仅正常模式轮询消息（DAEMON_MODE=1 时跳过，避免消费队列但无法唤醒 Claude）
+  # 仅正常模式轮询消息（DAEMON_MODE=1 时跳过）
   if [ "$DAEMON_MODE" != "1" ]; then
     result=$(curl -sf "$BASE_URL/api/messages" 2>/dev/null)
     count=$(echo "$result" | jq '.messages | length' 2>/dev/null)
 
     if [ "$count" -gt "0" ] 2>/dev/null; then
-      new_msgs=$(echo "$result" | jq '.messages')
-      ALL_MESSAGES=$(echo "$ALL_MESSAGES $new_msgs" | jq -s 'add')
+      # 短暂合并窗口：等 2 秒让更多消息到达，再 peek 一次拿到完整集合
+      sleep 2
+      result=$(curl -sf "$BASE_URL/api/messages" 2>/dev/null)
 
-      # 合并窗口：再等 3 秒看有没有更多消息
-      sleep 3
-      result2=$(curl -sf "$BASE_URL/api/messages" 2>/dev/null)
-      count2=$(echo "$result2" | jq '.messages | length' 2>/dev/null)
-      if [ "$count2" -gt "0" ] 2>/dev/null; then
-        new_msgs2=$(echo "$result2" | jq '.messages')
-        ALL_MESSAGES=$(echo "$ALL_MESSAGES $new_msgs2" | jq -s 'add')
-      fi
+      messages=$(echo "$result" | jq '.messages')
+      total=$(echo "$messages" | jq 'length')
 
-      total=$(echo "$ALL_MESSAGES" | jq 'length')
+      # 写入本地文件作为兜底（Claude 崩溃时不丢消息）
+      mkdir -p "$PROJECT_DIR/data"
+      echo "$messages" > "$PENDING_FILE"
+
       echo "=== Dashboard 新消息 (共 ${total} 条) ==="
-      echo "$ALL_MESSAGES" | jq '.[]'
+      echo "$messages" | jq '.[]'
 
       # 退出前自启 DAEMON_MODE 副本保活（只做心跳，不消费消息队列）
       SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
